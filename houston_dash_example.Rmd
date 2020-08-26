@@ -1,0 +1,422 @@
+---
+title: "SafeGraph Foot Traffic Origin Comparisons"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: scroll
+runtime: shiny
+---
+
+```{r global, include=FALSE}
+library(flexdashboard)
+library(data.table)
+library(DT)
+library(leaflet)
+library(tigris)
+library(scales)
+library(ggplot2)
+library(patchwork)
+
+
+# Get SafeGraph data
+dt <- readRDS('houston_vis.Rdata')
+
+locs <- readRDS('houston_loc.Rdata')
+setnames(locs, c('safegraph_place_id','location_name','street_address','city','naics_title','brands','broad_naics'),
+         c('SafeGraph ID','Location Name','Address','City','Industry','Brand','Broad Industry'))
+
+cbg <- readRDS('houston_cbg.Rdata')
+
+# Get map data
+mapdata <- readRDS('houstonmap.Rdata')
+
+aland <- as.data.table(mapdata)[,c('GEOID','ALAND')]
+setnames(aland,'GEOID','visitor_home_cbgs_index')
+
+cbg <- merge(cbg, aland)
+rm(aland)
+
+```
+
+Column {.sidebar}
+-----------------------------------------------------------------------
+
+Search through the SafeGraph places and fill in which locations (or location types) you'd like to compare here.
+
+As you fill in criteria, the search table on the right will help you narrow down the exact location you want and its SafeGraph ID.
+
+Select your **target locations**:
+
+```{r}
+textInput('sgid_t', label = 'SafeGraph ID')
+
+textInput('loc_t', label = 'Location Name', value = 'Whataburger')
+
+textInput('add_t', label = 'Address')
+
+textInput('city_t', label = 'City')
+
+textInput('brand_t', label = 'Brand')
+
+textInput('ind_t', label = 'Industry')
+
+textInput('bind_t', label = 'Broad Industry')
+```
+
+Select your **comparison locations**
+
+```{r}
+textInput('sgid_c', label = 'SafeGraph ID')
+
+textInput('loc_c', label = 'Location Name', value = 'McDonald\'s')
+
+textInput('add_c', label = 'Address')
+
+textInput('city_c', label = 'City')
+
+textInput('brand_c', label = 'Brand')
+
+textInput('ind_c', label = 'Industry')
+
+textInput('bind_c', label = 'Broad Industry')
+```
+
+Column
+-----------------------------------------------------------------------
+
+### Visits to Target vs. Comparison
+
+This graph calculates the percentage of visitors to the Target and Comparison location(s) that are from each area in Harris County, Texas in July, 2020. It then compares those percentages.
+
+Blue areas are a larger share of the Target's visitors than of the Comparison's visitors. Red areas are a larger share of the Comparison's visitors than the Target's. If you only see a few blue areas, that tells you that the Target's visitors are concetrated, while the Comparison's visitors are spread out.
+
+Location markers added for treatment/control if there are fifteen or fewer locations included.
+
+```{r}
+leaflet::renderLeaflet({
+  target <- copy(locs)
+  # Do each of these separate to avoid grepl calls
+  if (input$sgid_t != '') {
+    target <- target[`SafeGraph ID` %like% input$sgid_t]
+  }
+  if (input$loc_t != '') {
+    target <- target[`Location Name` %like% input$loc_t]
+  }
+  if (input$add_t != '') {
+    target <- target[Address %like% input$add_t]
+  }
+  if (input$city_t != '') {
+    target <- target[City %like% input$city_t]
+  }
+  if (input$ind_t != '') {
+    target <- target[Industry %like% input$ind_t]
+  }
+  if (input$bind_t != '') {
+    target <- target[Industry %like% input$bind_t]
+  }
+  
+  comp <- copy(locs)
+  # Do each of these separate to avoid grepl calls
+  if (input$sgid_c != '') {
+    comp <- comp[`SafeGraph ID` %like% input$sgid_c]
+  }
+  if (input$loc_c != '') {
+    comp <- comp[`Location Name` %like% input$loc_c]
+  }
+  if (input$add_c != '') {
+    comp <- comp[Address %like% input$add_c]
+  }
+  if (input$city_c != '') {
+    comp <- comp[City %like% input$city_c]
+  }
+  if (input$ind_c != '') {
+    comp <- comp[Industry %like% input$ind_c]
+  }
+  if (input$bind_c != '') {
+    comp <- comp[Industry %like% input$bind_c]
+  }
+  
+  tloc <- copy(target)
+  cloc <- copy(comp)
+  
+  target <- dt[safegraph_place_id %in% target[['SafeGraph ID']], c('visitor_home_cbgs_index','visitor_home_cbgs')]
+  target <- target[,.(visitor_home_cbgs = sum(visitor_home_cbgs)), by = 'visitor_home_cbgs_index']
+  target[,visitor_home_cbgs := visitor_home_cbgs/sum(visitor_home_cbgs)]
+  comp <- dt[safegraph_place_id %in% comp[['SafeGraph ID']], c('visitor_home_cbgs_index','visitor_home_cbgs')]
+  comp <- comp[,.(visitor_home_cbgs = sum(visitor_home_cbgs)), by = 'visitor_home_cbgs_index']
+  comp[,visitor_home_cbgs := visitor_home_cbgs/sum(visitor_home_cbgs)]
+  setnames(comp, 'visitor_home_cbgs', 'comp_cbgs')
+  
+  target <- merge(target, comp, by = 'visitor_home_cbgs_index', all = TRUE)
+  target[,tmc := fifelse(is.na(visitor_home_cbgs),0,visitor_home_cbgs) - fifelse(is.na(comp_cbgs),0,comp_cbgs)]
+  
+  mapwithdat <- geo_join(mapdata, target,
+                         by_sp = 'GEOID',
+                         by_df = 'visitor_home_cbgs_index')
+  mapwithdat$tmc <- fifelse(is.na(mapwithdat$tmc), 0, mapwithdat$tmc)
+  
+  pal <- colorNumeric("RdBu", domain=mapwithdat$tmc)
+
+  # Setting up the pop up text
+  popup_sb <- paste0("Census Block Group: ", mapwithdat$GEOID,'<br/>',
+                      "Target Percentage: ", percent(mapwithdat$visitor_home_cbgs, accuracy = .01),'<br/>',
+                     "Comparison Percentage: ", percent(mapwithdat$comp_cbgs, accuracy = .01),'<br/>',
+                     "Difference: ", percent(mapwithdat$tmc,accuracy = .01))
+  
+  lflt <- leaflet() %>%
+  addTiles() %>%
+  addPolygons(data = mapwithdat , 
+              fillColor = ~pal(mapwithdat$tmc), 
+              fillOpacity = 0.7, 
+              weight = 0.2, 
+              smoothFactor = 0.2, 
+              popup = ~popup_sb) %>%
+  addLegend(pal = pal, 
+            values = mapwithdat$tmc, 
+            position = "bottomright", 
+            title = "Target Share minus<br/>Comparison Share",
+            labFormat =labelFormat(suffix = '%', digits = 4,
+                                   transform = function(x) x*100)) 
+  if (nrow(tloc) <= 15) {
+    tlabs <- paste0('SafeGraph ID: ', tloc$`SafeGraph ID`)
+    lflt <- lflt %>%
+      addAwesomeMarkers(lng = ~longitude,
+                        lat = ~latitude,
+                        data = tloc,
+                        icon = awesomeIcons(
+                          icon = 'ios-close',
+                          iconColor = 'black',
+                          library = 'ion',
+                          markerColor = 'blue'
+                        ),
+                        label = tlabs) 
+  }
+  if (nrow(cloc) <= 15) {
+    clabs <- paste0('SafeGraph ID: ', cloc$`SafeGraph ID`)
+    lflt <- lflt %>%
+        addAwesomeMarkers(lng = ~longitude,
+                    lat = ~latitude,
+                    data = cloc,
+                    icon = awesomeIcons(
+                      icon = 'ios-close',
+                      iconColor = 'black',
+                      library = 'ion',
+                      markerColor = 'red'
+                    ),
+                    label = clabs)
+  }
+ print(lflt)
+ 
+})
+```
+
+### Characteristics of Target vs. Comparison Areas
+
+This weights the per-capita income, percent with a college degree (associate's degree or above), and population density characteristics of each census block group based on the proportion of the target and comparison locations that come from those census block groups.
+
+```{r, fig.height = 3}
+renderPlot({
+  target <- copy(locs)
+  # Do each of these separate to avoid grepl calls
+  if (input$sgid_t != '') {
+    target <- target[`SafeGraph ID` %like% input$sgid_t]
+  }
+  if (input$loc_t != '') {
+    target <- target[`Location Name` %like% input$loc_t]
+  }
+  if (input$add_t != '') {
+    target <- target[Address %like% input$add_t]
+  }
+  if (input$city_t != '') {
+    target <- target[City %like% input$city_t]
+  }
+  if (input$ind_t != '') {
+    target <- target[Industry %like% input$ind_t]
+  }
+  if (input$bind_t != '') {
+    target <- target[Industry %like% input$bind_t]
+  }
+  
+  comp <- copy(locs)
+  # Do each of these separate to avoid grepl calls
+  if (input$sgid_c != '') {
+    comp <- comp[`SafeGraph ID` %like% input$sgid_c]
+  }
+  if (input$loc_c != '') {
+    comp <- comp[`Location Name` %like% input$loc_c]
+  }
+  if (input$add_c != '') {
+    comp <- comp[Address %like% input$add_c]
+  }
+  if (input$city_c != '') {
+    comp <- comp[City %like% input$city_c]
+  }
+  if (input$ind_c != '') {
+    comp <- comp[Industry %like% input$ind_c]
+  }
+  if (input$bind_c != '') {
+    comp <- comp[Industry %like% input$bind_c]
+  }
+  
+  
+  target <- dt[safegraph_place_id %in% target[['SafeGraph ID']], c('visitor_home_cbgs_index','visitor_home_cbgs')]
+  target <- target[,.(visitor_home_cbgs = sum(visitor_home_cbgs)), by = 'visitor_home_cbgs_index']
+  target[,visitor_home_cbgs := visitor_home_cbgs/sum(visitor_home_cbgs)]
+  comp <- dt[safegraph_place_id %in% comp[['SafeGraph ID']], c('visitor_home_cbgs_index','visitor_home_cbgs')]
+  comp <- comp[,.(visitor_home_cbgs = sum(visitor_home_cbgs)), by = 'visitor_home_cbgs_index']
+  comp[,visitor_home_cbgs := visitor_home_cbgs/sum(visitor_home_cbgs)]
+  setnames(comp, 'visitor_home_cbgs', 'comp_cbgs')
+  
+  target <- merge(target, comp, by = 'visitor_home_cbgs_index', all = TRUE)
+  target[,visitor_home_cbgs := fifelse(is.na(visitor_home_cbgs),0,visitor_home_cbgs)]
+  target[,comp_cbgs := fifelse(is.na(comp_cbgs),0,comp_cbgs)]
+  target <- merge(target, cbg, by = 'visitor_home_cbgs_index', all.x = TRUE)
+  
+  target <- target[,.(colleget = weighted.mean(collegeshare, visitor_home_cbgs, na.rm = TRUE),
+                      incomet = weighted.mean(percap_income, visitor_home_cbgs, na.rm = TRUE),
+                      densityt = weighted.mean(population/ALAND, visitor_home_cbgs, na.rm = TRUE),
+                      collegec = weighted.mean(collegeshare, comp_cbgs, na.rm = TRUE),
+                      incomec = weighted.mean(percap_income, comp_cbgs, na.rm = TRUE),
+                      densityc = weighted.mean(population/ALAND, comp_cbgs, na.rm = TRUE))]
+  tgraph <- data.table(val = c(target$colleget[1],
+                                   target$collegec[1],
+                               target$incomet[1],
+                                  target$incomec[1],
+                               target$densityt[1],
+                                   target$densityc[1]),
+                       type = factor(rep(c('Target','Comparison'),3),levels = c('Target','Comparison')),
+                       var = c('Prop. w/ College Degree','Prop. w/ College Degree',
+                               'Per Capita Income','Per Capita Income',
+                               'Population Density','Population Density'))
+  p1 <- ggplot(tgraph[var == 'Per Capita Income'],
+               aes(x = type, y = val, fill = type)) + 
+    geom_col(position = 'dodge') + 
+    geom_text(aes(label = dollar(val, accuracy = 1)), size = 16/.pt, vjust = -.5) +
+    guides(fill = FALSE) + 
+    theme_minimal() + 
+    theme(text = element_text(size = 14),
+          axis.text.x = element_text(size = 14)) + 
+    scale_y_continuous(labels = function(x) dollar(x, accuracy = 1), limits = c(0, max(tgraph[var == 'Per Capita Income']$val+5000))) +
+    labs(x = '',
+         y = 'Per Capita Income') + 
+    scale_fill_manual(values = c('blue','red'))
+  p2 <- ggplot(tgraph[var == 'Prop. w/ College Degree'],
+               aes(x = type, y = val, fill = type)) + 
+    geom_col(position = 'dodge') + 
+    geom_text(aes(label = percent(val, accuracy = .1)), size = 16/.pt, vjust = -.5) +
+    guides(fill = FALSE) + 
+    theme_minimal() + 
+    theme(text = element_text(size = 14),
+          axis.text.x = element_text(size = 14)) + 
+    scale_y_continuous(labels = function(x) percent(x, accuracy = 1), limits = c(0, max(tgraph[var == 'Prop. w/ College Degree']$val) + .05)) +
+    labs(x = '',
+         y = 'Pct. With College Degree (Associate\'s+)')+ 
+    scale_fill_manual(values = c('blue','red'))
+  p3 <- ggplot(tgraph[var == 'Population Density'],
+               aes(x = type, y = val*1000, fill = type)) + 
+    geom_col(position = 'dodge') + 
+    geom_text(aes(label = number(val*1000, accuracy = .01)), size = 16/.pt, vjust = -.5) +
+    theme_minimal() + 
+    theme(text = element_text(size = 14),
+          axis.text.x = element_text(size = 14)) + 
+    scale_y_continuous(labels = function(x) number(x, accuracy = .01), limits = c(0,max(tgraph[var == 'Population Density']$val*1000+.1))) +
+    labs(x = '',
+         y = 'Pop. Density (K People/sq. mi.)')+ 
+    scale_fill_manual(values = c('blue','red'))
+  
+  p1 + p2 + p3
+})
+
+```
+
+### Location(s) Counted in Target
+
+(If no criteria are chosen, shows 100 random locations, but includes all locations in graph)
+
+```{r, fig.height =5}
+DT::renderDataTable({
+  target <- copy(locs)
+  # Do each of these separate to avoid grepl calls
+  anyin <- FALSE
+  if (input$sgid_t != '') {
+    target <- target[`SafeGraph ID` %like% input$sgid_t]
+    anyin <- TRUE
+  }
+  if (input$loc_t != '') {
+    target <- target[`Location Name` %like% input$loc_t]
+    anyin <- TRUE
+  }
+  if (input$add_t != '') {
+    target <- target[Address %like% input$add_t]
+    anyin <- TRUE
+  }
+  if (input$city_t != '') {
+    target <- target[City %like% input$city_t]
+    anyin <- TRUE
+  }
+  if (input$ind_t != '') {
+    target <- target[Industry %like% input$ind_t]
+    anyin <- TRUE
+  }
+  
+  if (!anyin) {
+    target <- target[sample(1:nrow(target), 100)]
+  }
+  
+  
+  DT::datatable(target, 
+                options = list(
+    bPaginate = TRUE
+  ))
+})
+
+
+```
+
+### Location(s) Counted in Comparison
+
+(If no criteria are chosen, shows 100 random locations, but includes all locations in graph)
+
+```{r}
+DT::renderDataTable({
+  comp <- copy(locs)
+  # Do each of these separate to avoid grepl calls
+  anyin <- FALSE
+  if (input$sgid_c != '') {
+    comp <- comp[`SafeGraph ID` %like% input$sgid_c]
+    anyin <- TRUE
+  }
+  if (input$loc_c != '') {
+    comp <- comp[`Location Name` %like% input$loc_c]
+    anyin <- TRUE
+  }
+  if (input$add_c != '') {
+    comp <- comp[Address %like% input$add_c]
+    anyin <- TRUE
+  }
+  if (input$city_c != '') {
+    comp <- comp[City %like% input$city_c]
+    anyin <- TRUE
+  }
+  if (input$ind_c != '') {
+    comp <- comp[Industry %like% input$ind_c]
+    anyin <- TRUE
+  }
+  
+  if (!anyin) {
+    comp <- comp[sample(1:nrow(comp), 100)]
+  }
+  
+  
+  DT::datatable(comp, 
+                options = list(
+    bPaginate = TRUE
+  ))
+})
+
+
+```
+
+
+
+
